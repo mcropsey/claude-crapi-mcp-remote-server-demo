@@ -33,20 +33,15 @@ Workshop   — Mechanic:             get_mechanics, mechanic_signup, get_service
 Identity   — Signup:               signup
 """
 
-import contextlib
 import json
 import os
-from collections.abc import AsyncIterator
 
 import httpx
 import uvicorn
 from mcp.server import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp import types
-from starlette.applications import Starlette
-from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
-from starlette.routing import Mount, Route
 from starlette.types import Receive, Scope, Send
 
 app = Server("crapi")
@@ -423,7 +418,7 @@ async def list_tools():
 # ── Tool execution ──────────────────────────────────────────────────────────────
 @app.call_tool()
 async def call_tool(name: str, arguments: dict):
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(timeout=60.0) as client:
 
         def ok(data):
             return [types.TextContent(type="text", text=json.dumps(data, indent=2))]
@@ -824,42 +819,60 @@ session_manager = StreamableHTTPSessionManager(
     app=app,
     event_store=None,     # no resumability store needed for this lab
     json_response=True,    # plain JSON responses; simpler for a proxy like this
-    stateless=True,        # each request is self-contained; easy to run/scale
+    stateless=False,       # stateful: server issues an Mcp-Session-Id per session
 )
 
-
-async def handle_mcp(scope: Scope, receive: Receive, send: Send) -> None:
-    # Optional shared-secret gate on the MCP endpoint itself.
-    if MCP_AUTH_TOKEN:
-        headers = dict(scope.get("headers") or [])
-        provided = headers.get(b"authorization", b"").decode()
-        if provided != f"Bearer {MCP_AUTH_TOKEN}":
-            resp = JSONResponse({"error": "unauthorized"}, status_code=401)
-            await resp(scope, receive, send)
-            return
-    await session_manager.handle_request(scope, receive, send)
+_MCP_PATH = "/" + MCP_PATH.strip("/")
 
 
-async def health(_: Request) -> PlainTextResponse:
-    return PlainTextResponse("ok")
+async def asgi_app(scope: Scope, receive: Receive, send: Send) -> None:
+    """Explicit ASGI dispatcher.
 
+    We route both /mcp and /mcp/ straight to the session manager so the request
+    that carries the recognizable /mcp path returns 200 itself. (A Starlette
+    Mount 307-redirects /mcp -> /mcp/, which makes API sensors such as Noname see
+    only a redirect on /mcp and the 2xx on a separate request, fragmenting the
+    MCP API in inventory.)
+    """
+    typ = scope["type"]
 
-@contextlib.asynccontextmanager
-async def lifespan(_: Starlette) -> AsyncIterator[None]:
-    async with session_manager.run():
-        yield
+    # Lifespan: keep the session manager's task group running for the app's life.
+    if typ == "lifespan":
+        async with session_manager.run():
+            while True:
+                message = await receive()
+                if message["type"] == "lifespan.startup":
+                    await send({"type": "lifespan.startup.complete"})
+                elif message["type"] == "lifespan.shutdown":
+                    await send({"type": "lifespan.shutdown.complete"})
+                    return
+        return
 
+    if typ != "http":
+        return
 
-starlette_app = Starlette(
-    debug=False,
-    routes=[
-        Route("/healthz", health, methods=["GET"]),
-        Mount(MCP_PATH, app=handle_mcp),
-    ],
-    lifespan=lifespan,
-)
+    path = scope.get("path", "")
+
+    if path == "/healthz":
+        await PlainTextResponse("ok")(scope, receive, send)
+        return
+
+    if path.rstrip("/") == _MCP_PATH:
+        # Optional shared-secret gate on the MCP endpoint itself.
+        if MCP_AUTH_TOKEN:
+            headers = dict(scope.get("headers") or [])
+            provided = headers.get(b"authorization", b"").decode()
+            if provided != f"Bearer {MCP_AUTH_TOKEN}":
+                await JSONResponse({"error": "unauthorized"}, status_code=401)(
+                    scope, receive, send
+                )
+                return
+        await session_manager.handle_request(scope, receive, send)
+        return
+
+    await JSONResponse({"error": "not found"}, status_code=404)(scope, receive, send)
 
 
 if __name__ == "__main__":
     # Single worker on purpose: the crAPI session token lives in-process memory.
-    uvicorn.run(starlette_app, host=HOST, port=PORT, workers=1)
+    uvicorn.run(asgi_app, host=HOST, port=PORT, workers=1)
