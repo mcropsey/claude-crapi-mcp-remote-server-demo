@@ -5,7 +5,7 @@ Middleware between Claude and a remote crAPI instance.
 Each tool maps to a real crAPI endpoint and demonstrates
 a specific OWASP API Top 10 vulnerability.
 
-Target: configured via the CRAPI_BASE environment variable (see crapi-mcp.env).
+Target: https://fast-green-sun-crapi.nnsworkshop.com/
 
 Demo order
 ----------
@@ -46,45 +46,9 @@ from starlette.types import Receive, Scope, Send
 
 app = Server("crapi")
 
-
-# ── Load configuration from the env file ────────────────────────────────────────
-# crapi-mcp.env is the single place to configure the target. Under systemd it's
-# loaded via EnvironmentFile (so this is a harmless no-op there); when running by
-# hand (python3 server.py) this makes the server read the SAME file, so the URL
-# lives in exactly one place no matter how the server is launched. Variables
-# already present in the real environment always win — the file only fills gaps.
-def _load_env_file():
-    path = os.environ.get("CRAPI_MCP_ENV") or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "crapi-mcp.env"
-    )
-    if not os.path.isfile(path):
-        return
-    with open(path) as fh:
-        for raw in fh:
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.startswith("export "):
-                line = line[len("export "):]
-            key, sep, value = line.partition("=")
-            if not sep:
-                continue
-            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
-
-
-_load_env_file()
-
 # ── Config (all overridable via environment) ────────────────────────────────────
-# The crAPI target. Read from the environment, which is populated either by
-# systemd's EnvironmentFile or by _load_env_file() above — both read crapi-mcp.env.
-# There is intentionally no hardcoded URL here, so the target lives in one place.
-# Fail fast if it's still unset (e.g. the env file is missing or has no CRAPI_BASE).
-API_BASE = os.environ.get("CRAPI_BASE", "").rstrip("/")
-if not API_BASE:
-    raise RuntimeError(
-        "CRAPI_BASE is not set. Configure the target URL in the environment "
-        "(e.g. CRAPI_BASE=https://crapi.cropseyit.com in crapi-mcp.env)."
-    )
+# The crAPI target. Point this at wherever crAPI is reachable FROM the RHEL box.
+API_BASE = os.environ.get("CRAPI_BASE", "https://fast-green-sun-crapi.nnsworkshop.com").rstrip("/")
 
 # Where this MCP server listens. 0.0.0.0 so it's reachable on the LAN/VPN.
 HOST = os.environ.get("MCP_HOST", "0.0.0.0")
@@ -855,11 +819,7 @@ session_manager = StreamableHTTPSessionManager(
     app=app,
     event_store=None,     # no resumability store needed for this lab
     json_response=True,    # plain JSON responses; simpler for a proxy like this
-    stateless=True,        # no per-session Mcp-Session-Id. A restart no longer
-                           # invalidates the client's session (which caused the
-                           # 404 "Invalid or expired session ID" after restarts).
-                           # The crAPI login token lives in a module global, not
-                           # the MCP session, so it still persists across calls.
+    stateless=False,       # stateful: server issues an Mcp-Session-Id per session
 )
 
 _MCP_PATH = "/" + MCP_PATH.strip("/")
