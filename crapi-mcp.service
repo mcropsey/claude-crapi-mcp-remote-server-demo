@@ -1,0 +1,22 @@
+[Unit]
+Description=crAPI MCP Server (Streamable HTTP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=crapimcp
+Group=crapimcp
+WorkingDirectory=/opt/crapi-mcp
+EnvironmentFile=/opt/crapi-mcp/crapi-mcp.env
+ExecStart=/opt/crapi-mcp/.venv/bin/python /opt/crapi-mcp/server.py
+Restart=on-failure
+RestartSec=3
+
+# Light hardening — fine for a lab, tighten further if you like.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
