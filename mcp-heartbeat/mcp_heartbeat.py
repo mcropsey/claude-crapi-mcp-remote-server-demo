@@ -191,6 +191,7 @@ def main():
     ap = argparse.ArgumentParser(description="MCP heartbeat / traffic keeper")
     ap.add_argument("--loop", action="store_true", help="run forever instead of one cycle")
     ap.add_argument("--interval", type=float, default=45.0, help="seconds between cycles in --loop mode")
+    ap.add_argument("--rounds", type=int, default=1, help="number of sessions per cron invocation (default 1; use 10+ to drive enough volume to keep the Noname score high between runs)")
     ap.add_argument("--quiet", action="store_true", help="suppress normal output; print only errors (cron-friendly)")
     ap.add_argument("--close", action="store_true", help="send DELETE /mcp at end (NOT recommended; can untag)")
     args = ap.parse_args()
@@ -225,7 +226,12 @@ def main():
         except KeyboardInterrupt:
             log("stopped.")
     else:
-        ok = once()
+        rounds = max(1, args.rounds)
+        ok = True
+        for n in range(rounds):
+            if rounds > 1 and not args.quiet:
+                log(f"--- round {n + 1}/{rounds} ---")
+            ok = once() and ok
         sys.exit(0 if ok else 1)
 
 

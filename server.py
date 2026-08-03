@@ -1076,11 +1076,22 @@ async def asgi_app(scope: Scope, receive: Receive, send: Send) -> None:
                 )
                 return
 
-        # Sensor-safety: intercept mcp-remote's pre-session GET /mcp (no
-        # Mcp-Session-Id yet) and return a benign 200 instead of the SDK's 400.
-        # A GET /mcp -> 400 is a non-qualifying packet that untags the API in
-        # Noname (IC-75487) on every reconnect. See _presession_get_ok().
-        if scope.get("method", "GET") == "GET" and not req_headers.get(b"mcp-session-id"):
+        # Sensor-safety: intercept ALL GET /mcp requests and return a benign 200.
+        #
+        # Two cases we must cover:
+        #   1. Pre-session GET (no Mcp-Session-Id) — mcp-remote opens this before
+        #      initialize. Stateful SDK rejects it with 400; 400 is non-qualifying.
+        #   2. Expired-session GET (Mcp-Session-Id present but unknown after a
+        #      restart) — stateful SDK returns 404 with no mcp-session-id in the
+        #      response; under IC-75487 that 404 is also non-qualifying and untags.
+        #
+        # Both collapse to the same fix: return _presession_get_ok (200 SSE with
+        # mcp-session-id / mcp-protocol-version, immediately closed). mcp-remote
+        # handles a cleanly-closed SSE stream by re-initializing, which is exactly
+        # what we want — it issues a fresh POST initialize and gets a real session.
+        # crAPI has no server->client notifications so losing the live SSE stream
+        # costs nothing. The sensor always sees GET /mcp -> 200 with MCP markers.
+        if scope.get("method", "GET") == "GET":
             await _presession_get_ok(scope, receive, send)
             return
 
