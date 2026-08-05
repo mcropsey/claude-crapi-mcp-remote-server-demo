@@ -16,9 +16,30 @@ want continuous traffic across the entire crAPI API surface.
 Both scripts now open the **`GET /mcp` SSE stream** after `initialize`, exactly
 like a real MCP client (`mcp-remote`) does — not just POSTs. That matters:
 Noname's MCP fingerprint can key on seeing that Streamable-HTTP GET stream, so a
-POST-only generator could be *seen but not classified as MCP*. Each cycle now
-produces the full real-client pattern:
-`initialize → notifications/initialized → GET /mcp (SSE) → tools/list → tools/call`.
+POST-only generator could be *seen but not classified as MCP*.
+
+### Long-lived sessions (strongly recommended)
+
+Noname currently keys Inventory identity on `mcp-session-id` and has non-sticky
+tagging (IC-75487). Short-lived sessions (a new `initialize` every cron tick)
+cause rapid create/drop of the MCP entry and its tools.
+
+Both scripts support **`--loop`**, which performs `initialize` **once** and then
+reuses the same `Mcp-Session-Id` for every subsequent `tools/list` + `tools/call`.
+Re-handshake happens only if the server reports the session as expired.
+
+You can (and should) run **both** scripts at the same time:
+
+```bash
+# Heartbeat — lightweight keep-alive
+MCP_URL=http://192.168.1.102:8009/mcp python3 mcp_heartbeat.py --loop --interval 45
+
+# Sweep — full coverage (read-only)
+MCP_URL=http://192.168.1.102:8009/mcp python3 crapi_sweep.py --loop --interval 60 --mode reads
+```
+
+Prefer `tmux`/`screen` or the systemd units in **Option C** below. This is the
+single biggest improvement for making the MCP tools stay visible in Noname.
 
 ### If the tag STILL doesn't appear when you run these (read this)
 
@@ -94,29 +115,57 @@ Stock `cron` works on macOS but the process needs Full Disk Access in some setup
 If cron is flaky, use a launchd plist or just run `--loop` (Option B) in a
 `tmux`/`screen` session.
 
-## Option B — run forever (no cron)
+## Option B — run forever with long-lived sessions (tmux / screen)
 
 ```bash
-MCP_URL=http://192.168.1.102:8009/mcp .venv/bin/python mcp_heartbeat.py --loop --interval 45
+# Heartbeat (lightweight keep-alive)
+tmux new -d -s mcp-hb \
+  "MCP_URL=http://192.168.1.102:8009/mcp /usr/bin/python3 /home/mcropsey/mcp-heartbeat/mcp_heartbeat.py --loop --interval 45"
+
+# Sweep (full coverage, read-only)
+tmux new -d -s mcp-sweep \
+  "MCP_URL=http://192.168.1.102:8009/mcp /usr/bin/python3 /home/mcropsey/mcp-heartbeat/crapi_sweep.py --loop --interval 60 --mode reads"
 ```
 
-Leave it in `tmux`/`screen`. `--interval` is seconds between cycles; 30–60s keeps
-the tag continuously warm.
+Each process holds its own long-lived `Mcp-Session-Id`. Run both if you want
+light keep-alive traffic **plus** continuous coverage of every crAPI endpoint.
 
-## Option C — systemd service on a Linux box (most robust)
+## Option C — systemd services (most robust, recommended)
+
+Create **two** units so both scripts run with long-lived sessions.  
+Do **not** redirect stdout/stderr to a file with `StandardOutput=append:...` — that commonly causes `Permission denied` (status 209/STDOUT). Let journald handle the logs.
 
 `/etc/systemd/system/mcp-heartbeat.service`:
-
 ```ini
 [Unit]
-Description=MCP heartbeat (keeps Noname MCP tag warm)
+Description=MCP heartbeat (long-lived session for Noname)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
+User=mcropsey
 Environment=MCP_URL=http://192.168.1.102:8009/mcp
-ExecStart=/opt/mcp-heartbeat/.venv/bin/python /opt/mcp-heartbeat/mcp_heartbeat.py --loop --interval 45
+ExecStart=/usr/bin/python3 /home/mcropsey/mcp-heartbeat/mcp_heartbeat.py --loop --interval 45
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`/etc/systemd/system/mcp-sweep.service`:
+```ini
+[Unit]
+Description=MCP full sweep (long-lived session, reads)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mcropsey
+Environment=MCP_URL=http://192.168.1.102:8009/mcp
+ExecStart=/usr/bin/python3 /home/mcropsey/mcp-heartbeat/crapi_sweep.py --loop --interval 60 --mode reads
 Restart=on-failure
 RestartSec=5
 
@@ -126,9 +175,17 @@ WantedBy=multi-user.target
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now mcp-heartbeat
+sudo systemctl enable --now mcp-heartbeat mcp-sweep
+
+# check status
+systemctl status mcp-heartbeat mcp-sweep
+
+# live logs (journald)
 journalctl -u mcp-heartbeat -f
+journalctl -u mcp-sweep -f
 ```
+
+Both units use `--loop`, so each process holds one stable `Mcp-Session-Id` for its entire lifetime. This is the preferred way to keep the Noname MCP tag and tool list stable while also driving full API traffic.
 
 ## Environment variables
 
