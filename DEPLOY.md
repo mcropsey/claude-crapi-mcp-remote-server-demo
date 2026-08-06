@@ -198,46 +198,75 @@ and a paired `200 OK`. That's the classifiable pair a sensor needs.
 
 ---
 
-## Troubleshooting: MCP entry + tools appear, then disappear after a restart
+## Troubleshooting: MCP entry + tools appear, then disappear
 
-Symptom: the crAPI MCP server and its ~28 tools show up in Noname Inventory, then
-vanish later — often after the service restarts or the box reboots.
+### Root cause analysis (full history)
 
-Root cause (two parts):
+Three successive bugs were diagnosed and fixed:
 
-1. **Unstable session id (fixable here).** The sensor keys Inventory identity off
-   the `mcp-session-id` the server advertises. Earlier, `server.py` minted a
-   random id at startup whenever `MCP_SESSION_ID` was unset, so every restart
-   (the unit has `Restart=on-failure`, plus any reboot / `systemctl restart`)
-   handed the sensor a *new* id. The sensor then treated it as a different server
-   and dropped the old record and its tools. **Fix:** `MCP_SESSION_ID` is now
-   pinned in `crapi-mcp.env`, and if left blank `server.py` persists a minted id
-   to `/opt/crapi-mcp/.mcp_session_id` so it still survives restarts.
+**Bug 1 — GET /mcp → 405 (v1 stateless mode)**
+The first build ran the transport in `stateless=True` mode. The MCP SDK rejects all
+GET requests with 405 in stateless mode. `mcp-remote` sends a GET /mcp *before*
+`initialize` to open the SSE stream, so every reconnect produced a bare GET→405 on
+`/mcp` — a non-qualifying packet that untags the API under IC-75487.
 
-2. **Sensor tag isn't sticky yet (upstream, not fixable here).** Per Noname, a
-   single non-qualifying packet to the MCP server currently untags it and deletes
-   its tools; making the tag sticky + adding a grace period is tracked in
-   IC-75487 (pending product sign-off), and the flapping display is IC-72703.
-   Once #1 is pinned there's a stable identity to re-tag, so the practical impact
-   drops sharply — but a burst of non-MCP traffic can still momentarily untag
-   until IC-75487 ships.
+Fix (v2): switched to `stateless=False` (stateful). The SDK then handles the
+post-session GET as a live SSE stream (200). A new interceptor (`_presession_get_ok`)
+was added to return 200 for the *pre-session* GET (the session-less one before
+initialize). This fixed the 405 issue.
 
-Verify the id is stable across restarts:
+**Bug 2 — New random session ID on every `initialize` (v2 stateful mode)**
+Stateful mode mints a fresh random `mcp-session-id` for each `initialize` call. With
+`--loop` on the heartbeat/sweep, every 45-second cycle called `run_cycle()` which
+started a new `initialize` and got a new random ID. Additionally the `_presession_get_ok`
+handler was generating *another* random uuid4 per GET — different from the initialize
+response's ID. Noname keyed its inventory on `mcp-session-id` and saw a different
+"server" on every cycle, dropping and re-creating the tool inventory constantly.
+
+The `MCP_SESSION_ID` env var was set in `crapi-mcp.env` but was never read by
+`server.py` — comments marked it "inert". This was the central oversight.
+
+**Bug 3 — `--loop` re-initialized every cycle (scripts)**
+The `--loop` flag in both scripts called `run_cycle()` in a loop — but `run_cycle()`
+did a full `initialize` at the start of every call. So `--loop` was not long-lived;
+it was just short sessions at regular intervals. This amplified Bug 2 by producing a
+new random session ID every 45–60 seconds.
+
+### Current fix (v3 — all three bugs resolved)
+
+`server.py`:
+- `stateless=True` — no per-session state. Clients reconnect freely, no 404 "expired session".
+- `_get_ok()` — intercepts **all** GET requests (pre- and post-session) and returns 200 with the pinned session ID. With `stateless=True` the SDK would 405 all GETs; this prevents that.
+- `_wrap_send_inject_session_id()` — ASGI wrapper that injects `MCP_SESSION_ID` (from `crapi-mcp.env`) into **every** POST response header. Every client (heartbeat, sweep, Claude Desktop) always receives the same stable `mcp-session-id` regardless of how many times they reconnect or the service restarts.
+- `MCP_SESSION_ID` is now read and used. If unset, a random id is minted once per process (stable for that run).
+
+Scripts:
+- `--loop` now calls `_run_loop()` which initializes **once** and reuses the session for all subsequent cycles. Re-initializes only when the server returns 404 (session expired). Confirmed: cycle 2+ shows `tools/list -> 200 cycle=N` with no new `initialize`.
+
+### Verify the session ID is pinned
 
 ```bash
-# advertised on every /mcp response — should be identical before and after a restart
-curl -sD - -o /dev/null -X POST http://127.0.0.1:8009/mcp/ \
+# Both calls should return the same mcp-session-id matching MCP_SESSION_ID in crapi-mcp.env
+SID1=$(curl -sD - -o /dev/null -X POST http://127.0.0.1:8009/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}' \
-  | grep -i mcp-session-id
+  | grep -i mcp-session-id)
+echo $SID1
+# Restart the service:
 sudo systemctl restart crapi-mcp && sleep 2
-# ...run the same curl again; the mcp-session-id must match.
-cat /opt/crapi-mcp/.mcp_session_id   # the persisted value (if MCP_SESSION_ID is blank)
+# Run the curl again — must return the SAME id:
+SID2=$(curl -sD - -o /dev/null -X POST http://127.0.0.1:8009/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}' \
+  | grep -i mcp-session-id)
+echo $SID2
+[ "$SID1" = "$SID2" ] && echo "PASS: session ID is stable" || echo "FAIL: IDs differ"
 ```
 
-If you ever *want* a fresh Inventory entry, change `MCP_SESSION_ID` (or delete the
-`.mcp_session_id` file) on purpose.
+To intentionally create a fresh Inventory entry (e.g. after a lab rebuild), change
+`MCP_SESSION_ID` in `crapi-mcp.env` to a new value and restart the service.
 
 ## Notes
 

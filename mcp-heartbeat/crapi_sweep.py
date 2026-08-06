@@ -255,10 +255,124 @@ def run_cycle(log, mode):
     return True
 
 
+def _run_loop(log, mode, interval, max_rounds):
+    """Long-lived session loop: initialize ONCE, reuse until the session expires."""
+    n = 0
+    while True:
+        tok = str(int(time.time()))
+        c = Client(log)
+        if not c.handshake():
+            log(f"handshake failed — retry in {interval}s", err=True)
+            time.sleep(interval)
+            continue
+        log(f"session={c.sid}  (long-lived, reusing until expired)")
+
+        # Reuse this session for repeated sweep cycles.
+        cycle = 0
+        while True:
+            n += 1
+            cycle += 1
+            tok = str(int(time.time()))
+            log(f"--- cycle {n} (session cycle {cycle}) ---")
+
+            # Check if session is still alive with a tools/list probe.
+            r = c._rpc("tools/list", {})
+            if r.status_code == 404:
+                log("session expired — re-initializing")
+                break  # outer while: re-handshake
+
+            # Run the sweep, passing the existing Client (which carries the session).
+            ok_before, err_before = c.ok, c.err
+            _sweep_with_client(c, tok, mode)
+            log(f"cycle done ({mode}): ok={c.ok - ok_before} err={c.err - err_before}")
+
+            if max_rounds and n >= max_rounds:
+                return
+            time.sleep(interval)
+
+
+def _sweep_with_client(c, tok, mode):
+    """Run one sweep cycle using an already-initialized Client."""
+    c.call("login", {"email": EMAIL, "password": PASSWORD})
+
+    # phase 1: reads + id harvesting
+    c.call("get_user_dashboard")
+    vehicles = c.call("get_vehicles")
+    vuuid = DEFAULT_VEHICLE
+    try:
+        if isinstance(vehicles, list) and vehicles:
+            vuuid = vehicles[0].get("uuid", DEFAULT_VEHICLE)
+    except Exception:
+        pass
+
+    posts = c.call("get_recent_posts")
+    post_id = None
+    try:
+        plist = posts.get("posts", []) if isinstance(posts, dict) else []
+        if plist:
+            post_id = plist[0].get("id")
+    except Exception:
+        pass
+
+    orders = c.call("get_all_orders")
+    order_id = 1
+    try:
+        olist = orders.get("orders", []) if isinstance(orders, dict) else []
+        if olist:
+            order_id = olist[0].get("id", 1)
+    except Exception:
+        pass
+
+    c.call("get_vehicle_location", {"vehicle_id": vuuid})
+    c.call("get_vehicle_details", {"vehicle_id": vuuid})
+    c.call("get_products")
+    c.call("get_mechanics")
+    c.call("get_service_requests")
+    c.call("check_coupon", {"coupon_code": "TRAC075"})
+    c.call("get_report", {"report_id": 1})
+    c.call("get_order", {"order_id": 1})
+    if post_id:
+        c.call("get_post", {"post_id": post_id})
+    c.call("get_all_users")
+
+    if mode == "reads":
+        return
+
+    # phase 2: writes (mode == all)
+    c.call("create_post", {"title": f"sweep {tok}", "content": f"automated sweep {tok}"})
+    if post_id:
+        c.call("post_comment", {"post_id": post_id, "content": f"sweep comment {tok}"})
+    c.call("add_product", {"name": f"Sweep Part {tok}", "price": 9.99,
+                           "image_url": "https://example.com/part.png"})
+    new_order = c.call("create_order", {"product_id": 1, "quantity": 1})
+    oid = order_id
+    try:
+        if isinstance(new_order, dict) and "id" in new_order:
+            oid = new_order["id"]
+    except Exception:
+        pass
+    c.call("return_order", {"order_id": oid})
+    c.call("mechanic_signup", {"name": f"Sweep Mech {tok}", "email": f"sweep-{tok}@my.lab",
+                               "number": "555-000-0000", "password": PASSWORD,
+                               "mechanic_code": f"TRAC_SWEEP_{tok}"})
+    c.call("change_email", {"old_email": EMAIL, "new_email": f"mike1-{tok}@my.lab"})
+    c.call("reset_password", {"email": EMAIL})
+    c.call("verify_email_token", {"email": EMAIL, "token": "000000"})
+    c.call("verify_otp", {"email": EMAIL, "otp": "0000", "password": PASSWORD})
+    c.call("update_video_name", {"video_id": 0, "videoName": f"vid-{tok}",
+                                 "available_credit": 99999})
+    c.call("request_service", {"mechanic_code": "TRAC_JHN", "vin": DEFAULT_VIN,
+                               "problem_details": "sweep"})
+    c.call("receive_report", {"mechanic_code": "TRAC_JHN",
+                              "report_link": "http://example.com/report",
+                              "status": "Finished"})
+
+
 def main():
     ap = argparse.ArgumentParser(description="Drive all crAPI endpoints via MCP, no Claude")
     ap.add_argument("--mode", choices=["reads", "all"], default="all")
-    ap.add_argument("--loop", action="store_true")
+    ap.add_argument("--loop", action="store_true",
+                    help="run forever with one long-lived session (re-initializes only on 404)")
     ap.add_argument("--interval", type=float, default=60.0)
     ap.add_argument("--rounds", type=int, default=0, help="0 = one cycle (or infinite with --loop)")
     ap.add_argument("--quiet", action="store_true", help="only print errors (cron-friendly)")
@@ -275,20 +389,9 @@ def main():
     if not args.quiet:
         log(f"crapi-sweep -> {MCP_URL}  mode={args.mode}")
 
-    def once():
-        return run_cycle(log, args.mode)
-
     if args.loop:
-        n = 0
         try:
-            while True:
-                n += 1
-                if not args.quiet:
-                    log(f"--- cycle {n} ---")
-                once()
-                if args.rounds and n >= args.rounds:
-                    break
-                time.sleep(args.interval)
+            _run_loop(log, args.mode, args.interval, args.rounds)
         except KeyboardInterrupt:
             log("stopped.")
     else:
@@ -297,7 +400,7 @@ def main():
         for n in range(rounds):
             if rounds > 1 and not args.quiet:
                 log(f"--- cycle {n + 1} ---")
-            healthy = once() and healthy
+            healthy = run_cycle(log, args.mode) and healthy
         sys.exit(0 if healthy else 1)
 
 

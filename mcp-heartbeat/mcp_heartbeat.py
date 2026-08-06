@@ -187,11 +187,82 @@ def run_cycle(log):
     return errors == 0
 
 
+def _run_loop(log, interval, close):
+    """Long-lived session loop: initialize ONCE, reuse the session until expired."""
+    calls = [
+        ("login", {"email": EMAIL, "password": PASSWORD}),
+        ("get_recent_posts", {}),
+        ("get_products", {}),
+        ("get_user_dashboard", {}),
+    ]
+    while True:
+        # ── establish session ────────────────────────────────────────────────────
+        s = requests.Session()
+        try:
+            r = _rpc(s, None, "initialize", {
+                "protocolVersion": PROTO,
+                "capabilities": {},
+                "clientInfo": {"name": "mcp-heartbeat", "version": "1.0"},
+            }, rid=1)
+        except Exception as e:
+            log(f"initialize FAILED: {e} — retry in {interval}s", err=True)
+            time.sleep(interval)
+            continue
+        sid = r.headers.get("mcp-session-id") or r.headers.get("Mcp-Session-Id")
+        log(f"initialize     -> {r.status_code}  session={sid}")
+        if r.status_code >= 400 or not sid:
+            log(f"no session id (status {r.status_code}) — retry in {interval}s", err=True)
+            time.sleep(interval)
+            continue
+        _rpc(s, sid, "notifications/initialized", notification=True)
+        _open_sse(s, sid, log)
+
+        # ── reuse session for subsequent cycles ──────────────────────────────────
+        rid = 2
+        n = 0
+        expired = False
+        try:
+            while True:
+                n += 1
+                r = _rpc(s, sid, "tools/list", {}, rid=rid); rid += 1
+                if r.status_code == 404:
+                    log("session expired — re-initializing")
+                    expired = True
+                    break
+                log(f"tools/list     -> {r.status_code}  cycle={n}")
+                ok = err = 0
+                for name, a in calls:
+                    r2 = _rpc(s, sid, "tools/call", {"name": name, "arguments": a}, rid=rid)
+                    rid += 1
+                    if r2.status_code == 404:
+                        log(f"session expired during {name} — re-initializing")
+                        expired = True
+                        break
+                    log(f"tools/call {name:<18} -> {r2.status_code}")
+                    (ok if r2.status_code < 400 else err)
+                    ok += 1 if r2.status_code < 400 else 0
+                    err += 0 if r2.status_code < 400 else 1
+                if expired:
+                    break
+                log(f"cycle done: ok={ok} errors={err} session={sid}")
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            log(f"cycle error: {e} — re-initializing", err=True)
+        if close:
+            try:
+                requests.delete(MCP_URL, headers=BASE_HEADERS, timeout=10)
+                log("sent DELETE /mcp")
+            except Exception:
+                pass
+
+
 def main():
     ap = argparse.ArgumentParser(description="MCP heartbeat / traffic keeper")
-    ap.add_argument("--loop", action="store_true", help="run forever instead of one cycle")
+    ap.add_argument("--loop", action="store_true", help="run forever with one long-lived session (re-initializes only on 404)")
     ap.add_argument("--interval", type=float, default=45.0, help="seconds between cycles in --loop mode")
-    ap.add_argument("--rounds", type=int, default=1, help="number of sessions per cron invocation (default 1; use 10+ to drive enough volume to keep the Noname score high between runs)")
+    ap.add_argument("--rounds", type=int, default=1, help="number of sessions per cron invocation")
     ap.add_argument("--quiet", action="store_true", help="suppress normal output; print only errors (cron-friendly)")
     ap.add_argument("--close", action="store_true", help="send DELETE /mcp at end (NOT recommended; can untag)")
     args = ap.parse_args()
@@ -207,22 +278,10 @@ def main():
     if not args.quiet:
         log(f"heartbeat -> {MCP_URL}")
 
-    def once():
-        healthy = run_cycle(log)
-        if args.close:
-            # opt-in only; documented as risky for tagging
-            try:
-                requests.delete(MCP_URL, headers=BASE_HEADERS, timeout=10)
-                log("sent DELETE /mcp (--close)")
-            except Exception as e:
-                log(f"DELETE failed: {e}", err=True)
-        return healthy
-
     if args.loop:
+        # Long-lived: one session for the process lifetime, only re-initializes on 404.
         try:
-            while True:
-                once()
-                time.sleep(args.interval)
+            _run_loop(log, args.interval, args.close)
         except KeyboardInterrupt:
             log("stopped.")
     else:
@@ -231,7 +290,14 @@ def main():
         for n in range(rounds):
             if rounds > 1 and not args.quiet:
                 log(f"--- round {n + 1}/{rounds} ---")
-            ok = once() and ok
+            healthy = run_cycle(log)
+            if args.close:
+                try:
+                    requests.delete(MCP_URL, headers=BASE_HEADERS, timeout=10)
+                    log("sent DELETE /mcp (--close)")
+                except Exception as e:
+                    log(f"DELETE failed: {e}", err=True)
+            ok = healthy and ok
         sys.exit(0 if ok else 1)
 
 

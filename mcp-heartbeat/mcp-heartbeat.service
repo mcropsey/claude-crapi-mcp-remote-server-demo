@@ -1,0 +1,15 @@
+[Unit]
+Description=MCP heartbeat (long-lived session for Noname)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mcropsey
+Environment=MCP_URL=http://192.168.1.102:8009/mcp
+ExecStart=/usr/bin/python3 /home/mcropsey/mcp-heartbeat/mcp_heartbeat.py --loop --interval 45
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

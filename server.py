@@ -33,6 +33,7 @@ Workshop   — Mechanic:             get_mechanics, mechanic_signup, get_service
 Identity   — Signup:               signup
 """
 
+import asyncio
 import json
 import os
 import uuid
@@ -97,29 +98,34 @@ MCP_PATH = os.environ.get("MCP_PATH", "/mcp")
 # If set, the client (mcp-remote) must send: Authorization: Bearer <this value>.
 MCP_AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 
-# ── MCP session identity (standard transport) ───────────────────────────────────
-# This server runs the stock STATEFUL Streamable HTTP transport (see
-# StreamableHTTPSessionManager below), so the MCP SDK owns session identity end to
-# end: it mints a real Mcp-Session-Id on the `initialize` response and validates it
-# on every subsequent request, and it serves GET /mcp as a 200 SSE stream. That is
-# exactly how every other stock MCP server behaves, and it is what keeps an API
-# sensor (e.g. Noname) classifying and RETAINING this endpoint as MCP.
+# ── MCP session identity ──────────────────────────────────────────────────────────
+# TRANSPORT: stateless=True (see StreamableHTTPSessionManager below).
+# All GETs are intercepted in the ASGI layer and return 200 (so Noname never sees
+# a 405 from the SDK). Every /mcp response carries the PINNED session ID below via
+# the _wrap_send_inject_session_id wrapper so Noname's sensor always maps this
+# traffic to the same Inventory entry, regardless of how many times clients
+# reconnect or the service restarts.
 #
-# History / why this changed: an earlier build ran the transport STATELESS and
-# manually injected mcp-session-id / mcp-protocol-version headers on every response
-# (with a pinned, persisted id) to try to satisfy the sensor. That shim caused the
-# flapping it was meant to fix — stateless mode rejects the GET /mcp SSE stream with
-# 405, and mcp-remote opens that GET on every connection, so /mcp kept receiving a
-# bare GET->405 with no JSON-RPC method: a non-qualifying packet that untags the API
-# (tracked upstream as IC-75487 / display flap IC-72703). Running standard stateful
-# removes that edge traffic entirely, so the pinned-id hack and the header injection
-# are both gone. MCP_SESSION_ID / MCP_SESSION_ID_FILE in crapi-mcp.env are now inert
-# and can be removed from the env file.
+# History of iterations:
+#   v1 — stateless + manual header injection (pinned id): broke on GET /mcp → 405
+#          (stateless SDK rejects all GETs; the 405 was a non-qualifying packet that
+#          untags the API under IC-75487).
+#   v2 — stateful (stateless=False): fixed the GET → 405 by letting the SDK own the
+#          SSE stream, but introduced a NEW problem: stateful mode mints a FRESH
+#          random mcp-session-id on every `initialize`. Every heartbeat/sweep cycle,
+#          and every Claude Desktop reconnect, gets a different id → Noname treats
+#          each as a brand-new server and drops the old tool inventory.
+#   v3 (current) — stateless=True + GET interceptor for ALL GETs + ASGI response
+#          wrapper that injects the pinned id on every POST response. Stateless mode
+#          means no session validation, so clients can reconnect freely without
+#          getting 404 "expired session". The pinned id ensures Noname sees one
+#          stable identity. The GET interceptor returns 200 (not 405), so GETs
+#          from mcp-remote are always qualifying traffic.
 #
-# MCP_PROTOCOL_VERSION is read only so an operator can still pin the advertised
-# protocol version via env if a future client negotiates a different one; the SDK
-# handles version negotiation itself by default.
+# MCP_SESSION_ID: set in crapi-mcp.env to survive restarts. If unset, a random id
+# is minted once per process (stable for that run, but not across restarts).
 MCP_PROTOCOL_VERSION = os.environ.get("MCP_PROTOCOL_VERSION", "2025-06-18")
+MCP_SESSION_ID = os.environ.get("MCP_SESSION_ID", "") or uuid.uuid4().hex
 
 # crAPI session token. Seeded from CRAPI_TOKEN if present, but the `login` tool
 # updates this in-memory at runtime — no file edit or restart needed anymore.
@@ -879,63 +885,84 @@ async def call_tool(name: str, arguments: dict):
 session_manager = StreamableHTTPSessionManager(
     app=app,
     event_store=None,     # no resumability store needed for this lab
-    json_response=True,    # POST /mcp responses are a single application/json
-                           # JSON-RPC body (not SSE-framed). Kept True on purpose:
-                           # this is the response shape the sensor already parses
-                           # and classifies. The flapping was never about the POST
-                           # body format — it was the stateless GET->405 below, so
-                           # we change ONLY that and leave the POST responses
-                           # byte-for-byte as the sensor already knows them.
-                           # (json_response does not affect the GET SSE stream; that
-                           # is governed by stateless below.)
-    stateless=False,       # standard per-session Mcp-Session-Id lifecycle — the
-                           # SDK issues the id on initialize and validates it on
-                           # every subsequent request, exactly like the stock
-                           # Streamable HTTP servers other customers run without
-                           # any flapping. A restart drops in-memory sessions, so
-                           # a live client gets ONE 404 "Invalid or expired session
-                           # ID" then mcp-remote auto-reinitializes — self-healing,
-                           # and that 404 rides inside a valid MCP session context
-                           # (not a bare non-qualifying packet). The crAPI login
-                           # token lives in a module global, not MCP session state,
-                           # so it still persists across calls and across the
-                           # reconnect.
+    json_response=True,   # POST /mcp responses are application/json (not SSE-framed).
+                          # Fine for Noname's classifier.
+    stateless=True,       # No per-session state or session-id validation. Combined
+                          # with _wrap_send_inject_session_id (below) which pins
+                          # MCP_SESSION_ID on every response, all clients always
+                          # receive the same stable identifier — Noname never sees
+                          # "new server". The crAPI token lives in a module global
+                          # (not session state), so it survives across tool calls.
+                          # Stateless mode also means no 404 "expired session" after
+                          # a service restart — clients continue seamlessly.
 )
 
 _MCP_PATH = "/" + MCP_PATH.strip("/")
 
 
-async def _presession_get_ok(scope: Scope, receive: Receive, send: Send) -> None:
-    """Answer mcp-remote's pre-session GET /mcp with a benign 200 (+ MCP markers).
+async def _get_ok(scope: Scope, receive: Receive, send: Send) -> None:
+    """Return 200 text/event-stream for any GET /mcp, held open until disconnect.
 
-    Why this exists: mcp-remote opens a GET /mcp SSE stream to receive
-    server->client messages BEFORE it has completed `initialize`, so that first
-    GET carries no Mcp-Session-Id. In stateful mode the MCP SDK spec-correctly
-    rejects a session-less GET with 400 Bad Request. That 400 is harmless to the
-    client (it re-opens the GET with a real session right after initialize), but
-    to the API sensor a GET /mcp -> 400 is a NON-QUALIFYING packet: not JSON-RPC,
-    not a recognized MCP method, 4xx. Under Noname's not-sticky-tag behavior
-    (IC-75487) a single such packet untags the API — and this one fires on EVERY
-    Claude Desktop reconnect, which is the recurring "my MCP data disappeared"
-    cause we traced in the access log.
+    With stateless=True the SDK would 405 every GET. We intercept ALL GETs here
+    and return a proper SSE stream with the pinned MCP markers.
 
-    So we intercept ONLY the pre-session GET (no Mcp-Session-Id header) and return
-    a 200 text/event-stream response carrying mcp-session-id / mcp-protocol-version,
-    then close it. The sensor now only ever sees qualifying 2xx MCP traffic on
-    /mcp. Once the client has initialized, its GET carries a real Mcp-Session-Id
-    and flows to the SDK normally (200 SSE) — we do not touch that path.
+    IMPORTANT: we hold the stream open (more_body=True) and wait for the client
+    to disconnect. Closing immediately causes mcp-remote to retry in <1s, flooding
+    the server with GET requests (16+/second) and producing anomalous traffic that
+    confuses Noname's MCP classifier. A long-lived SSE GET matches what a real
+    Streamable HTTP MCP client (mcp-remote) maintains throughout its session.
     """
     headers = [
         (b"content-type", b"text/event-stream"),
         (b"cache-control", b"no-cache"),
-        (b"mcp-session-id", uuid.uuid4().hex.encode()),
+        (b"mcp-session-id", MCP_SESSION_ID.encode()),
         (b"mcp-protocol-version", MCP_PROTOCOL_VERSION.encode()),
     ]
     await send({"type": "http.response.start", "status": 200, "headers": headers})
-    # A minimal, immediately-closed SSE body. mcp-remote handled the old 400
-    # without looping, so it handles a clean 200 the same way and proceeds to
-    # POST initialize.
-    await send({"type": "http.response.body", "body": b": ok\n\n", "more_body": False})
+    # Send the opening SSE comment so the client sees a valid stream start.
+    await send({"type": "http.response.body", "body": b": ok\n\n", "more_body": True})
+
+    # Hold open: send a keepalive comment every 30 s; close on client disconnect.
+    # asyncio.wait_for on receive() gives us the disconnect event without a spin loop.
+    while True:
+        try:
+            msg = await asyncio.wait_for(receive(), timeout=30.0)
+            if msg.get("type") == "http.disconnect":
+                break
+        except asyncio.TimeoutError:
+            # Client still connected — send keepalive so the connection doesn't
+            # time out in the network path.
+            try:
+                await send({"type": "http.response.body", "body": b": keepalive\n\n", "more_body": True})
+            except Exception:
+                break  # send failed — client gone
+
+    await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+
+def _wrap_send_inject_session_id(send):
+    """Wrap the ASGI send callable to pin MCP_SESSION_ID on every POST response.
+
+    The stateless session manager returns no mcp-session-id header of its own.
+    We inject (or replace) the pinned value here so every /mcp POST response —
+    initialize, tools/list, tools/call, notifications/initialized — carries the
+    same stable identifier. Noname keys its inventory entry on this value, so a
+    stable ID means tools never disappear between reconnects or service restarts.
+    """
+    _sid   = MCP_SESSION_ID.encode()
+    _proto = MCP_PROTOCOL_VERSION.encode()
+
+    async def patched_send(message):
+        if message["type"] == "http.response.start":
+            hdrs = [
+                (k, v) for k, v in message.get("headers", [])
+                if k.lower() not in (b"mcp-session-id", b"mcp-protocol-version")
+            ]
+            hdrs += [(b"mcp-session-id", _sid), (b"mcp-protocol-version", _proto)]
+            message = {**message, "headers": hdrs}
+        await send(message)
+
+    return patched_send
 
 
 # ── LLM / GenAI Endpoints (for Noname discovery) ─────────────────────────────────
@@ -1076,24 +1103,18 @@ async def asgi_app(scope: Scope, receive: Receive, send: Send) -> None:
                 )
                 return
 
-        # Sensor-safety: intercept mcp-remote's pre-session GET /mcp (no
-        # Mcp-Session-Id yet) and return a benign 200 instead of the SDK's 400.
-        # A GET /mcp -> 400 is a non-qualifying packet that untags the API in
-        # Noname (IC-75487) on every reconnect. See _presession_get_ok().
-        if scope.get("method", "GET") == "GET" and not req_headers.get(b"mcp-session-id"):
-            await _presession_get_ok(scope, receive, send)
+        # ALL GETs → pinned 200 SSE (see _get_ok). With stateless=True the SDK
+        # would 405 every GET; intercepting here keeps every /mcp response qualifying.
+        if scope.get("method", "GET") == "GET":
+            await _get_ok(scope, receive, send)
             return
 
-        # Hand the request to the stock stateful Streamable HTTP manager and let
-        # it run the standard MCP session lifecycle end to end: it issues the real
-        # Mcp-Session-Id on initialize, validates it on every subsequent POST, and
-        # serves the GET /mcp SSE stream with a 200. We deliberately do NOT touch
-        # the request's session-id header or rewrite the response headers anymore —
-        # the transport owns both. That is what makes this box behave like every
-        # other customer's MCP server and keeps Noname's MCP tag stable, instead of
-        # the earlier stateless + header-injection shim that produced GET->405 and
-        # stripped-session traffic the sensor read as non-qualifying.
-        await session_manager.handle_request(scope, receive, send)
+        # POSTs → stateless session manager, wrapped to pin MCP_SESSION_ID on the
+        # response so every client (heartbeat, sweep, Claude Desktop) always receives
+        # the same stable identifier and Noname never sees a "new server".
+        await session_manager.handle_request(
+            scope, receive, _wrap_send_inject_session_id(send)
+        )
         return
 
     # ── LLM / GenAI route handling ──────────────────────────────────────────────

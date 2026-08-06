@@ -28,13 +28,25 @@ Both scripts support **`--loop`**, which performs `initialize` **once** and then
 reuses the same `Mcp-Session-Id` for every subsequent `tools/list` + `tools/call`.
 Re-handshake happens only if the server reports the session as expired.
 
+> **Server-side pinning (v3 server):** `server.py` now injects a stable pinned
+> `mcp-session-id` (from `MCP_SESSION_ID` in `crapi-mcp.env`) on **every** response,
+> regardless of what the client sends. So even if the script re-initializes, the
+> session ID Noname sees is always the same value. The `--loop` long-lived session
+> behavior and server-side pinning are both active — belt and suspenders.
+
+> **GET SSE stream (v3 server):** The server holds the GET /mcp SSE connection
+> open with 30-second keepalive pings until the client disconnects. This matches
+> what a real Streamable HTTP MCP client (`mcp-remote`) does and is what Noname's
+> classifier keys on. Do **not** use a client that immediately closes the GET stream
+> — that causes a retry storm (16+ GETs/sec) that looks anomalous to the classifier.
+
 You can (and should) run **both** scripts at the same time:
 
 ```bash
-# Heartbeat — lightweight keep-alive
+# Heartbeat — lightweight keep-alive (long-lived session)
 MCP_URL=http://192.168.1.102:8009/mcp python3 mcp_heartbeat.py --loop --interval 45
 
-# Sweep — full coverage (read-only)
+# Sweep — full coverage (read-only, long-lived session)
 MCP_URL=http://192.168.1.102:8009/mcp python3 crapi_sweep.py --loop --interval 60 --mode reads
 ```
 
@@ -43,25 +55,35 @@ single biggest improvement for making the MCP tools stay visible in Noname.
 
 ### If the tag STILL doesn't appear when you run these (read this)
 
-These scripts are now byte-for-byte the right *kind* of traffic — proven at the
-crAPI layer (their posts/orders/mechanics show up) and now matching a real MCP
-client's request pattern. So if Noname still won't tag from them, the remaining
-variable is **not the script — it's whether the sensor sees this host's traffic
-at all.** Everything that has ever tagged in your tenant arrived from the Mac
-(`192.168.1.188`) path. If the Linux box's path to the MCP server doesn't cross
-the sensor's tap/SPAN, none of this traffic reaches the classifier no matter how
-correct it is.
+**Check in order:**
 
-One test settles it: close Claude Desktop, run **only** one of these scripts, and
-watch the `/mcp` record's *last-seen* in Noname.
-- **Last-seen updates** → the sensor sees this host; the scripts are doing their job.
-- **Last-seen frozen** → the sensor is blind to this host's path. No code change
-  fixes that — run the script from a host on the Mac's monitored path, or get the
-  Linux box's segment added to the SPAN/mirror feeding Noname.
+1. **Is 192.168.1.98 up?** `ping 192.168.1.98` from .102. If it's down, no traffic
+   is being generated. Start .98 and wait 5–15 minutes.
+
+2. **Is the session ID pinned?** On .102: `curl -sD - -o /dev/null -X POST
+   http://127.0.0.1:8009/mcp -H "Content-Type: application/json" -H "Accept:
+   application/json, text/event-stream" -d '{"jsonrpc":"2.0","id":1,"method":
+   "initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},
+   "clientInfo":{"name":"t","version":"0"}}}' | grep -i mcp-session-id`
+   Should return `dda4790c468c411384ab60193d50bed4`. If not, check `MCP_SESSION_ID`
+   in `/opt/crapi-mcp/crapi-mcp.env`.
+
+3. **Is there a GET flood?** `journalctl -u crapi-mcp -n 20 --no-pager` on .102.
+   Should be mostly POSTs. If you see rapid GETs every fraction of a second, the
+   SSE hold-open is broken — check the server version.
+
+4. **Does the sensor see .98's traffic?** Close Claude Desktop, run only the
+   heartbeat, and watch the `/mcp` record's *last-seen* in Noname.
+   - **Last-seen updates** → sensor sees .98; scripts are working.
+   - **Last-seen frozen** → sensor is blind to .98's path. Run scripts from the
+     Mac (192.168.1.188) instead — that path is confirmed visible.
+
+5. **MCP View vs API Inventory:** Per Noname, the MCP View requires `API Type = MCP`
+   (set after the learning window), not just an MCP insight tag. Tags can lag first
+   transaction by 5–15 minutes. Wait, then refresh.
 
 Note: these scripts run anywhere Python + `requests` do, **including the Mac**
-(`python3 mcp_heartbeat.py`), which is the known-good path — that's the fastest way
-to get a Claude-free keep-alive that the sensor definitely sees.
+(`python3 mcp_heartbeat.py`), which is the known-good sensor path.
 
 ---
 
