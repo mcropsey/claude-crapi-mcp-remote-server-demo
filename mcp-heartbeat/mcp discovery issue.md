@@ -102,3 +102,18 @@ With the fix, the traffic now matches a genuine Streamable HTTP MCP deployment:
 - **Do NOT send DELETE /mcp.** A session-terminating DELETE is not a JSON-RPC method
   call and can untag the API under IC-75487. Scripts never send DELETE unless `--close`
   is explicitly passed.
+
+### 2026-11-16 — sensor restart left the long-lived sessions unclassified
+
+The .102 sensor was re-pointed to a new tenant and restarted. The heartbeat and
+sweep loops had sent their only `initialize` hours earlier, so the new sensor
+saw only `tools/list` / `tools/call` and never a qualifying handshake. Claude's
+own traffic (fresh handshake per connection) was discovered fine.
+
+Fix: `--reinit-every N` in both scripts (units: heartbeat 20, sweep 15, about
+every 15 min). The pinned `mcp-session-id` means re-initializing keeps the same ID.
+
+Also on 11-16: `CRAPI_BASE` switched from the Cloudflare URL to direct
+`http://192.168.1.101:8888` (Cloudflare added 0.2-1.1s per call and ~1% of sweep
+calls hit the 20s timeout). `crapi_sweep.py` now catches `requests.RequestException`
+per cycle and on handshake instead of crashing.

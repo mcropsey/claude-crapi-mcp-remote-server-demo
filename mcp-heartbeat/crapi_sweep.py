@@ -255,13 +255,23 @@ def run_cycle(log, mode):
     return True
 
 
-def _run_loop(log, mode, interval, max_rounds):
-    """Long-lived session loop: initialize ONCE, reuse until the session expires."""
+def _run_loop(log, mode, interval, max_rounds, reinit_every=0):
+    """Long-lived session loop: initialize ONCE, reuse until the session expires.
+
+    reinit_every=N (>0) re-runs the full handshake every N session cycles so a
+    sensor that restarted mid-session sees a qualifying MCP handshake again.
+    The server pins mcp-session-id, so the session ID does not change.
+    """
     n = 0
     while True:
         tok = str(int(time.time()))
         c = Client(log)
-        if not c.handshake():
+        try:
+            hs_ok = c.handshake()
+        except requests.RequestException as e:
+            log(f"handshake error: {type(e).__name__}: {e}", err=True)
+            hs_ok = False
+        if not hs_ok:
             log(f"handshake failed — retry in {interval}s", err=True)
             time.sleep(interval)
             continue
@@ -275,20 +285,30 @@ def _run_loop(log, mode, interval, max_rounds):
             tok = str(int(time.time()))
             log(f"--- cycle {n} (session cycle {cycle}) ---")
 
-            # Check if session is still alive with a tools/list probe.
-            r = c._rpc("tools/list", {})
-            if r.status_code == 404:
-                log("session expired — re-initializing")
-                break  # outer while: re-handshake
-
-            # Run the sweep, passing the existing Client (which carries the session).
+            # A slow upstream (crAPI via Cloudflare) occasionally stalls one call past
+            # the timeout. Log it and keep the session instead of crashing the process
+            # (a crash means a systemd restart loop + a LogSystemdUnitFailing alert).
             ok_before, err_before = c.ok, c.err
-            _sweep_with_client(c, tok, mode)
-            log(f"cycle done ({mode}): ok={c.ok - ok_before} err={c.err - err_before}")
+            try:
+                # Check if session is still alive with a tools/list probe.
+                r = c._rpc("tools/list", {})
+                if r.status_code == 404:
+                    log("session expired — re-initializing")
+                    break  # outer while: re-handshake
+
+                # Run the sweep, passing the existing Client (which carries the session).
+                _sweep_with_client(c, tok, mode)
+                log(f"cycle done ({mode}): ok={c.ok - ok_before} err={c.err - err_before}")
+            except requests.RequestException as e:
+                c.err += 1
+                log(f"cycle aborted ({mode}): {type(e).__name__}: {e} — retry next cycle", err=True)
 
             if max_rounds and n >= max_rounds:
                 return
             time.sleep(interval)
+            if reinit_every and cycle % reinit_every == 0:
+                log(f"periodic re-initialize (every {reinit_every} cycles)")
+                break  # outer while: re-handshake
 
 
 def _sweep_with_client(c, tok, mode):
@@ -374,6 +394,8 @@ def main():
     ap.add_argument("--loop", action="store_true",
                     help="run forever with one long-lived session (re-initializes only on 404)")
     ap.add_argument("--interval", type=float, default=60.0)
+    ap.add_argument("--reinit-every", type=int, default=0,
+                    help="--loop: redo the full MCP handshake every N cycles (0 = only on 404)")
     ap.add_argument("--rounds", type=int, default=0, help="0 = one cycle (or infinite with --loop)")
     ap.add_argument("--quiet", action="store_true", help="only print errors (cron-friendly)")
     args = ap.parse_args()
@@ -391,7 +413,7 @@ def main():
 
     if args.loop:
         try:
-            _run_loop(log, args.mode, args.interval, args.rounds)
+            _run_loop(log, args.mode, args.interval, args.rounds, args.reinit_every)
         except KeyboardInterrupt:
             log("stopped.")
     else:

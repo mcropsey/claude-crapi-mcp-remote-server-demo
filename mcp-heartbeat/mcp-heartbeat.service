@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 User=mcropsey
 Environment=MCP_URL=http://192.168.1.102:8009/mcp
-ExecStart=/usr/bin/python3 /home/mcropsey/mcp-heartbeat/mcp_heartbeat.py --loop --interval 45
+ExecStart=/usr/bin/python3 /home/mcropsey/mcp-heartbeat/mcp_heartbeat.py --loop --interval 45 --reinit-every 20
 Restart=on-failure
 RestartSec=5
 

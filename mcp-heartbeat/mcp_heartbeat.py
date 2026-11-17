@@ -187,8 +187,14 @@ def run_cycle(log):
     return errors == 0
 
 
-def _run_loop(log, interval, close):
-    """Long-lived session loop: initialize ONCE, reuse the session until expired."""
+def _run_loop(log, interval, close, reinit_every=0):
+    """Long-lived session loop: initialize ONCE, reuse the session until expired.
+
+    reinit_every=N (>0) re-runs the full handshake (initialize ->
+    notifications/initialized -> GET /mcp SSE) every N cycles, so a sensor that
+    restarted or was re-pointed mid-session sees a qualifying MCP handshake again.
+    The server pins mcp-session-id, so this does not change the session ID.
+    """
     calls = [
         ("login", {"email": EMAIL, "password": PASSWORD}),
         ("get_recent_posts", {}),
@@ -246,6 +252,9 @@ def _run_loop(log, interval, close):
                     break
                 log(f"cycle done: ok={ok} errors={err} session={sid}")
                 time.sleep(interval)
+                if reinit_every and n % reinit_every == 0:
+                    log(f"periodic re-initialize (every {reinit_every} cycles)")
+                    break
         except KeyboardInterrupt:
             raise
         except Exception as e:
@@ -262,6 +271,8 @@ def main():
     ap = argparse.ArgumentParser(description="MCP heartbeat / traffic keeper")
     ap.add_argument("--loop", action="store_true", help="run forever with one long-lived session (re-initializes only on 404)")
     ap.add_argument("--interval", type=float, default=45.0, help="seconds between cycles in --loop mode")
+    ap.add_argument("--reinit-every", type=int, default=0,
+                    help="--loop: redo the full MCP handshake every N cycles (0 = only on 404)")
     ap.add_argument("--rounds", type=int, default=1, help="number of sessions per cron invocation")
     ap.add_argument("--quiet", action="store_true", help="suppress normal output; print only errors (cron-friendly)")
     ap.add_argument("--close", action="store_true", help="send DELETE /mcp at end (NOT recommended; can untag)")
@@ -281,7 +292,7 @@ def main():
     if args.loop:
         # Long-lived: one session for the process lifetime, only re-initializes on 404.
         try:
-            _run_loop(log, args.interval, args.close)
+            _run_loop(log, args.interval, args.close, args.reinit_every)
         except KeyboardInterrupt:
             log("stopped.")
     else:

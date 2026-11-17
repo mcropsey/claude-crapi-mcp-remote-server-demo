@@ -292,3 +292,13 @@ exercise of the whole API (e.g. once every few minutes, or a bounded `--rounds`)
   `request_service`, `receive_report`) and the two dummy-token 500s
   (`verify_email_token`, `verify_otp`) will show non-200s in `--mode all` — that's
   expected and still counts as qualifying MCP traffic.
+
+### Periodic re-initialize (`--reinit-every N`, added 2026-11-16)
+
+In `--loop` mode both scripts can redo the full handshake (`initialize` ->
+`notifications/initialized` -> `GET /mcp` SSE) every N cycles. Without it, a
+sensor that restarts or is re-pointed mid-session never sees a qualifying MCP
+handshake again (this happened 2026-11-16 when the .102 sensor moved tenants).
+The server pins `mcp-session-id`, so re-initializing does not change the ID.
+The systemd units use `--reinit-every 20` (heartbeat, ~15 min) and
+`--reinit-every 15` (sweep, ~15 min). `0` (default) = re-init only on 404.

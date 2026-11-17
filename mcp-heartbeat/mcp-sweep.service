@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 User=mcropsey
 Environment=MCP_URL=http://192.168.1.102:8009/mcp
-ExecStart=/usr/bin/python3 /home/mcropsey/mcp-heartbeat/crapi_sweep.py --loop --interval 60 --mode reads
+ExecStart=/usr/bin/python3 /home/mcropsey/mcp-heartbeat/crapi_sweep.py --loop --interval 60 --mode reads --reinit-every 15
 Restart=on-failure
 RestartSec=5
 
